@@ -1,0 +1,41 @@
+name: Verifica LiDAR Studio 3D
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Scarica repository
+        uses: actions/checkout@v4
+
+      - name: Estrai progetto ZIP
+        shell: bash
+        run: |
+          if [ ! -d LiDARStudio3D.xcodeproj ]; then
+            unzip -o LiDARStudio3D_START_iPhone.zip
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add README.md LiDARStudio3D LiDARStudio3D.xcodeproj
+            git commit -m "Aggiunge sorgenti Swift"
+            git push
+          fi
+
+      - name: Verifica Xcode
+        run: xcodebuild -version
+
+      - name: Compila senza firma
+        run: |
+          xcodebuild \
+            -project LiDARStudio3D.xcodeproj \
+            -target LiDARStudio3D \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            CODE_SIGNING_ALLOWED=NO \
+            build
