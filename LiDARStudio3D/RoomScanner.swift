@@ -62,5 +62,12 @@ final class RoomScanner: NSObject, ObservableObject, RoomCaptureViewDelegate {
         } catch {
             status = "Impossibile esportare il modello: \(error.localizedDescription)"
         }
+    }     // Metodi richiesti dal protocollo NSCoding
+    nonisolated required init?(coder: NSCoder) {
+        return nil
+    }
+
+    nonisolated func encode(with coder: NSCoder) {
+        // RoomScanner non viene archiviato.
     }
 }
