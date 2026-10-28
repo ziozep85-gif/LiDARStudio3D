@@ -9,10 +9,11 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var preview = false
     @State private var confirmNew = false
+    @State private var settings = false
 
     var body: some View {
         VStack(spacing: 12) {
-            Text("LiDAR Studio · Scanner RGB 0.3").font(.headline)
+            Text("LiDAR Studio · Scanner RGB 0.3.1").font(.headline)
             RGBCameraView(session: scanner.session)
                 .overlay(alignment: .topLeading) {
                     Text("\(scanner.count.formatted()) punti")
@@ -37,12 +38,33 @@ struct ContentView: View {
                     ShareLink("Salva o condividi PLY", item: url)
                 }
             }
-            Text("Muoviti lentamente, con buona luce. Distanza 0,2–4 m.\nGriglia 2,5 cm · massimo 300.000 punti")
+            Button("Impostazioni scansione") { settings = true }
+                .disabled(scanner.running)
+            Text("\(scanner.scanSummary)\nEpisodi di tracking limitato: \(scanner.trackingLosses)")
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
         }
         .padding()
         .confirmationDialog("Iniziare una nuova scansione? Esporta prima i punti da conservare.", isPresented: $confirmNew, titleVisibility: .visible) {
             Button("Nuova scansione", role: .destructive) { scanner.start() }
+        }
+        .sheet(isPresented: $settings) {
+            NavigationStack {
+                Form {
+                    Picker("Densità", selection: $scanner.density) {
+                        ForEach(RGBDensity.allCases) { density in
+                            Text(density.rawValue).tag(density)
+                        }
+                    }
+                    VStack(alignment: .leading) {
+                        Text("Distanza massima: \(scanner.maxDistance, specifier: "%.1f") m")
+                        Slider(value: $scanner.maxDistance, in: 1...4, step: 0.5)
+                    }
+                    Text("Per la scrivania: griglia 1 cm, distanza massima 2 m. Una griglia più fine aumenta punti, memoria e tempi; non aumenta la precisione del LiDAR.")
+                    Text("Muoviti lentamente di lato, mantenendo superfici con dettagli nell’inquadratura. Evita rotazioni brusche. La densità non corregge la deriva o le superfici sdoppiate.")
+                }
+                .navigationTitle("Acquisizione")
+                .toolbar { Button("Fine") { settings = false } }
+            }
         }
         .sheet(isPresented: $preview) {
             NavigationStack {
@@ -77,14 +99,22 @@ private struct RGBPoint {
     let b: UInt8
 }
 
+private enum RGBDensity: String, CaseIterable, Identifiable {
+    case standard = "Standard · 2,5 cm"
+    case fine = "Fine · 1 cm"
+    var id: String { rawValue }
+    var voxelSize: Float { self == .fine ? 0.01 : 0.025 }
+    var pointLimit: Int { self == .fine ? 600_000 : 300_000 }
+}
+
 private struct RGBVoxel: Hashable {
     let x: Int32
     let y: Int32
     let z: Int32
-    init(_ p: SIMD3<Float>) {
-        x = Int32(floor(p.x / 0.025))
-        y = Int32(floor(p.y / 0.025))
-        z = Int32(floor(p.z / 0.025))
+    init(_ p: SIMD3<Float>, size: Float) {
+        x = Int32(floor(p.x / size))
+        y = Int32(floor(p.y / size))
+        z = Int32(floor(p.z / size))
     }
 }
 
@@ -101,7 +131,19 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
     private var points: [RGBPoint] = []
     private var voxels: Set<RGBVoxel> = []
     private var lastTime: TimeInterval = -1
-    private let limit = 300_000
+    @Published var density: RGBDensity = .fine
+    @Published var maxDistance: Double = 2
+    @Published private(set) var trackingLosses = 0
+    private var activeDensity: RGBDensity = .fine
+    private var activeDistance: Float = 2
+    private var stableSince: TimeInterval?
+    private var trackingWasLimited = false
+    private var limit: Int { activeDensity.pointLimit }
+    var scanSummary: String {
+        let selected = count > 0 || running ? activeDensity : density
+        let distance = count > 0 || running ? Double(activeDistance) : maxDistance
+        return "\(selected.rawValue) · 0,2–\(String(format: "%.1f", distance)) m"
+    }
 
     override init() {
         super.init()
@@ -132,6 +174,11 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
         count = 0
         exportedURL = nil
         lastTime = -1
+        activeDensity = density
+        activeDistance = Float(maxDistance)
+        trackingLosses = 0
+        trackingWasLimited = false
+        stableSince = nil
         let config = ARWorldTrackingConfiguration()
         config.frameSemantics = .sceneDepth
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
@@ -150,7 +197,16 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
         guard running, frame.timestamp - lastTime >= 0.2 else { return }
         lastTime = frame.timestamp
         guard case .normal = frame.camera.trackingState else {
+            if !trackingWasLimited { trackingLosses += 1 }
+            trackingWasLimited = true
+            stableSince = nil
             status = "Localizzazione non stabile: rallenta e inquadra superfici con dettagli."
+            return
+        }
+        trackingWasLimited = false
+        if stableSince == nil { stableSince = frame.timestamp }
+        guard let stableSince, frame.timestamp - stableSince >= 0.6 else {
+            status = "Attendo tracking stabile…"
             return
         }
         guard let depth = frame.sceneDepth else { status = "Attendo dati LiDAR…"; return }
@@ -159,7 +215,7 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
         status = "Acquisizione RGB in corso"
         if count >= limit {
             stop()
-            status = "Limite di 300.000 punti raggiunto. Esporta la scansione."
+            status = "Limite di \(limit.formatted()) punti raggiunto. Esporta la scansione."
         }
     }
 
@@ -205,7 +261,7 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
                     if base.load(fromByteOffset: offset, as: UInt8.self) < 2 { continue }
                 }
                 let d = row[x]
-                guard d.isFinite, d >= 0.2, d <= 4 else { continue }
+                guard d.isFinite, d >= 0.2, d <= activeDistance else { continue }
                 // Optical image: x right, y down, z forward. ARKit camera:
                 // x right, y up, viewing direction -z. Both maps use native
                 // sensor orientation; UI portrait rotation must not be applied.
@@ -214,7 +270,7 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
                 let p = SIMD3<Float>(world.x, world.y, world.z)
                 guard p.x.isFinite, p.y.isFinite, p.z.isFinite,
                       abs(p.x) < 10000, abs(p.y) < 10000, abs(p.z) < 10000 else { continue }
-                guard voxels.insert(RGBVoxel(p)).inserted else { continue }
+                guard voxels.insert(RGBVoxel(p, size: activeDensity.voxelSize)).inserted else { continue }
                 let ix = min(iw - 1, Int((Float(x) + 0.5) * Float(iw) / Float(w)))
                 let iy = min(ih - 1, Int((Float(y) + 0.5) * Float(ih) / Float(h)))
                 let ux = min(uw - 1, ix * uw / iw), uy = min(uh - 1, iy * uh / ih)
@@ -271,7 +327,7 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     func exportPLY() {
         guard !running, !points.isEmpty else { return }
-        var data = Data("ply\nformat binary_little_endian 1.0\ncomment LiDAR Studio RGB 0.3; meters; Y up\nelement vertex \(points.count)\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n".utf8)
+        var data = Data("ply\nformat binary_little_endian 1.0\ncomment LiDAR Studio RGB 0.3.1; meters; Y up\ncomment voxel_m \(activeDensity.voxelSize); max_depth_m \(activeDistance); tracking_interruptions \(trackingLosses)\nelement vertex \(points.count)\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n".utf8)
         data.reserveCapacity(data.count + points.count * 15)
         for p in points {
             for f in [p.position.x, p.position.y, p.position.z] {
