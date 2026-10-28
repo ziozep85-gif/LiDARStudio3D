@@ -3,7 +3,7 @@ name: IPA iPhone - LiDAR Studio 3D
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, 'feature/lidar-rgb']
     paths:
       - '.github/workflows/build-ipa-iphone.yml'
       - 'LiDARStudio3D/**'
