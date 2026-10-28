@@ -1,0 +1,60 @@
+name: IPA iPhone - LiDAR Studio 3D
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-ipa-iphone.yml'
+      - 'LiDARStudio3D/**'
+      - 'LiDARStudio3D.xcodeproj/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-26
+    steps:
+      - name: Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: Verifica Xcode e il progetto
+        shell: bash
+        run: |
+          xcodebuild -version
+          test -f LiDARStudio3D.xcodeproj/project.pbxproj
+          test -f LiDARStudio3D/RoomScanner.swift
+
+      - name: Compila per iPhone reale senza firma
+        shell: bash
+        run: |
+          xcodebuild \
+            -project LiDARStudio3D.xcodeproj \
+            -target LiDARStudio3D \
+            -configuration Debug \
+            -sdk iphoneos \
+            "SYMROOT=$RUNNER_TEMP/ios-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Crea IPA non firmato
+        shell: bash
+        run: |
+          APP_PATH="$RUNNER_TEMP/ios-build/Debug-iphoneos/LiDARStudio3D.app"
+          test -d "$APP_PATH" || { echo "App non trovata: $APP_PATH"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "$GITHUB_WORKSPACE/LiDARStudio3D-unsigned.ipa" Payload
+          unzip -t "$GITHUB_WORKSPACE/LiDARStudio3D-unsigned.ipa" > /dev/null
+
+      - name: Rendi scaricabile il file IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiDARStudio3D-IPA-iPhone
+          path: LiDARStudio3D-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
