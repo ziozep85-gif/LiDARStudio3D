@@ -3,6 +3,7 @@ import ARKit
 import SceneKit
 import AVFoundation
 import simd
+import CoreImage
 
 struct ContentView: View {
     @StateObject private var scanner = RGBScanner()
@@ -13,7 +14,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Text("LiDAR Studio · Scanner RGB 0.3.1").font(.headline)
+            Text("LiDAR Studio · Scanner RGB 0.3.2").font(.headline)
             RGBCameraView(session: scanner.session)
                 .overlay(alignment: .topLeading) {
                     Text("\(scanner.count.formatted()) punti")
@@ -26,7 +27,7 @@ struct ContentView: View {
                     if scanner.running { scanner.stop() }
                     else if scanner.count > 0 { confirmNew = true }
                     else { scanner.start() }
-                }.buttonStyle(.borderedProminent).disabled(!RGBScanner.supported)
+                }.buttonStyle(.borderedProminent).disabled(!RGBScanner.supported || scanner.datasetBusy)
                 Button("Anteprima 3D") {
                     scanner.makePreview()
                     preview = true
@@ -38,18 +39,29 @@ struct ContentView: View {
                     ShareLink("Salva o condividi PLY", item: url)
                 }
             }
+            if !scanner.running && scanner.recordedFrames > 0 {
+                Button(scanner.datasetBusy ? "Preparazione ZIP…" : "Esporta dataset RGB-D") {
+                    scanner.exportDataset()
+                }.disabled(scanner.datasetBusy)
+                if let url = scanner.datasetURL {
+                    ShareLink("Salva o condividi dataset ZIP", item: url)
+                }
+            }
+            Text(scanner.datasetStatus).font(.caption).foregroundStyle(.secondary)
             Button("Impostazioni scansione") { settings = true }
                 .disabled(scanner.running)
             Text("\(scanner.scanSummary)\nEpisodi di tracking limitato: \(scanner.trackingLosses)")
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
         }
         .padding()
-        .confirmationDialog("Iniziare una nuova scansione? Esporta prima i punti da conservare.", isPresented: $confirmNew, titleVisibility: .visible) {
+        .confirmationDialog("Iniziare una nuova scansione? Esporta prima PLY e dataset da conservare.", isPresented: $confirmNew, titleVisibility: .visible) {
             Button("Nuova scansione", role: .destructive) { scanner.start() }
         }
         .sheet(isPresented: $settings) {
             NavigationStack {
                 Form {
+                    Toggle("Registra dataset RGB-D", isOn: $scanner.datasetEnabled)
+                    Text("Circa 1 foto/s, massimo 60. Salva RGB, profondità e pose per analizzare il disallineamento. Dopo Termina esporta lo ZIP e salvalo in File.")
                     Picker("Densità", selection: $scanner.density) {
                         ForEach(RGBDensity.allCases) { density in
                             Text(density.rawValue).tag(density)
@@ -118,8 +130,8 @@ private struct RGBVoxel: Hashable {
     }
 }
 
-// Delegate callbacks and UI actions run on the main queue. No frame or pixel
-// buffer is retained beyond a callback; the scan has a fixed memory bound.
+// UI and AR callbacks use the main queue. Dataset writing uses a serial
+// worker with at most one pending RGB/depth/confidence buffer set.
 private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
     static var supported: Bool { ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) }
     let session = ARSession()
@@ -134,6 +146,12 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
     @Published var density: RGBDensity = .fine
     @Published var maxDistance: Double = 2
     @Published private(set) var trackingLosses = 0
+    @Published var datasetEnabled = true
+    @Published private(set) var recordedFrames = 0
+    @Published private(set) var datasetURL: URL?
+    @Published private(set) var datasetBusy = false
+    @Published private(set) var datasetStatus = "Dataset RGB-D: pronto, fino a 60 fotogrammi"
+    private var recorder: RGBDRecorder?
     private var activeDensity: RGBDensity = .fine
     private var activeDistance: Float = 2
     private var stableSince: TimeInterval?
@@ -152,7 +170,7 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func start() {
-        guard Self.supported, !running else { return }
+        guard Self.supported, !running, !datasetBusy else { return }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: begin()
         case .notDetermined:
@@ -167,7 +185,20 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func begin() {
-        guard !running else { return }
+        guard !running, !datasetBusy else { return }
+        do {
+            if datasetEnabled {
+                recorder = try RGBDRecorder(voxel: density.voxelSize, maxDepth: Float(maxDistance))
+            } else {
+                recorder = nil
+            }
+        } catch {
+            status = "Impossibile preparare il dataset: \(error.localizedDescription)"
+            return
+        }
+        datasetURL = nil
+        recordedFrames = 0
+        datasetStatus = datasetEnabled ? "Dataset: registrazione attiva, massimo 60 fotogrammi" : "Dataset: disattivato"
         points.removeAll(keepingCapacity: true)
         voxels.removeAll(keepingCapacity: true)
         previewScene = SCNScene()
@@ -210,6 +241,18 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
         guard let depth = frame.sceneDepth else { status = "Attendo dati LiDAR…"; return }
+        if let recorder {
+            recorder.capture(frame, depth: depth, trackingLosses: trackingLosses) { [weak self, weak recorder] result in
+                guard let self, let recorder, self.recorder === recorder else { return }
+                switch result {
+                case .success(let saved):
+                    self.recordedFrames = saved
+                    self.datasetStatus = "Dataset: \(saved)/60 fotogrammi salvati"
+                case .failure(let error):
+                    self.datasetStatus = "Registrazione dataset fermata: \(error.localizedDescription). Esporta i fotogrammi già salvati."
+                }
+            }
+        }
         accumulate(frame, depth: depth)
         count = points.count
         status = "Acquisizione RGB in corso"
@@ -325,9 +368,27 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
         previewScene = scene
     }
 
+    func exportDataset() {
+        guard !running, !datasetBusy, let recorder else { return }
+        datasetBusy = true
+        datasetURL = nil
+        datasetStatus = "Preparazione dataset ZIP…"
+        recorder.export(trackingLosses: trackingLosses) { [weak self] result in
+            guard let self else { return }
+            self.datasetBusy = false
+            switch result {
+            case .success(let url):
+                self.datasetURL = url
+                self.datasetStatus = "Dataset pronto: usa Salva o condividi dataset ZIP."
+            case .failure(let error):
+                self.datasetStatus = "Esportazione dataset fallita: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func exportPLY() {
         guard !running, !points.isEmpty else { return }
-        var data = Data("ply\nformat binary_little_endian 1.0\ncomment LiDAR Studio RGB 0.3.1; meters; Y up\ncomment voxel_m \(activeDensity.voxelSize); max_depth_m \(activeDistance); tracking_interruptions \(trackingLosses)\nelement vertex \(points.count)\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n".utf8)
+        var data = Data("ply\nformat binary_little_endian 1.0\ncomment LiDAR Studio RGB 0.3.2; meters; Y up\ncomment voxel_m \(activeDensity.voxelSize); max_depth_m \(activeDistance); tracking_interruptions \(trackingLosses)\nelement vertex \(points.count)\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n".utf8)
         data.reserveCapacity(data.count + points.count * 15)
         for p in points {
             for f in [p.position.x, p.position.y, p.position.z] {
@@ -352,5 +413,254 @@ private final class RGBScanner: NSObject, ObservableObject, ARSessionDelegate {
     func sessionWasInterrupted(_ session: ARSession) {
         stop()
         status = "Sessione interrotta. Puoi esportare i punti raccolti."
+    }
+}
+
+private func datasetError(_ message: String) -> NSError {
+    NSError(domain: "LiDARStudioRGB.Dataset", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message])
+}
+
+private final class RGBDRecorder {
+    private let queue = DispatchQueue(label: "LiDARStudioRGB.dataset", qos: .utility)
+    private let context = CIContext(options: [.cacheIntermediates: false])
+    private let directory: URL
+    private let voxel: Float
+    private let maxDepth: Float
+    // Main queue only.
+    private var pending = false
+    private var failed = false
+    private var lastTimestamp: TimeInterval = -1
+    private var submitted = 0
+    // Worker queue only.
+    private var frames: [[String: Any]] = []
+    private var captureError: String?
+
+    init(voxel: Float, maxDepth: Float) throws {
+        self.voxel = voxel
+        self.maxDepth = maxDepth
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RGBD-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    deinit {
+        let url = directory
+        queue.async { try? FileManager.default.removeItem(at: url) }
+    }
+
+    // Input buffers belong to one ARFrame. Retain only buffers, not ARFrame.
+    func capture(_ frame: ARFrame, depth: ARDepthData, trackingLosses: Int,
+                 completion: @escaping (Result<Int, Error>) -> Void) {
+        guard !pending, !failed, submitted < 60,
+              lastTimestamp < 0 || frame.timestamp - lastTimestamp >= 1 else { return }
+        guard CVPixelBufferGetPixelFormatType(depth.depthMap) == kCVPixelFormatType_DepthFloat32 else { return }
+        pending = true
+        lastTimestamp = frame.timestamp
+        let index = submitted
+        submitted += 1
+        let image = frame.capturedImage
+        let map = depth.depthMap
+        let confidence = depth.confidenceMap
+        let w = CVPixelBufferGetWidth(image), h = CVPixelBufferGetHeight(image)
+        let dw = CVPixelBufferGetWidth(map), dh = CVPixelBufferGetHeight(map)
+        let transform = frame.camera.transform
+        let k = frame.camera.intrinsics
+        var dk = k
+        let sx = Float(dw) / Float(frame.camera.imageResolution.width)
+        let sy = Float(dh) / Float(frame.camera.imageResolution.height)
+        for column in 0..<3 { dk[column][0] *= sx; dk[column][1] *= sy }
+        let stem = String(format: "frame_%04d", index)
+        func matrix3(_ m: simd_float3x3) -> [[Float]] {
+            (0..<3).map { c in [m[c][0], m[c][1], m[c][2]] }
+        }
+        let metadata: [String: Any] = [
+            "index": index, "timestamp_seconds": frame.timestamp,
+            "rgb": "\(stem)/rgb.jpg", "depth": "\(stem)/depth.f32",
+            "image_width": w, "image_height": h, "depth_width": dw, "depth_height": dh,
+            "intrinsics_columns": matrix3(k), "depth_intrinsics_columns": matrix3(dk),
+            "camera_to_world_columns": (0..<4).map { c in
+                [transform[c][0], transform[c][1], transform[c][2], transform[c][3]]
+            },
+            "tracking": "normal", "tracking_limited_episodes": trackingLosses,
+            "world_mapping_status_raw": frame.worldMappingStatus.rawValue
+        ]
+        queue.async { [self] in
+            let folder = directory.appendingPathComponent(stem, isDirectory: true)
+            do {
+                let saved: Int = try autoreleasepool {
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    let ciImage = CIImage(cvPixelBuffer: image)
+                    guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent),
+                          let jpeg = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.9) else {
+                        throw datasetError("Impossibile codificare la fotografia RGB.")
+                    }
+                    try jpeg.write(to: folder.appendingPathComponent("rgb.jpg"), options: .atomic)
+                    try Self.packedDepth(map).write(to: folder.appendingPathComponent("depth.f32"), options: .atomic)
+                    var record = metadata
+                    if let confidence {
+                        try Self.packedConfidence(confidence).write(to: folder.appendingPathComponent("confidence.u8"), options: .atomic)
+                        record["confidence"] = "\(stem)/confidence.u8"
+                        record["confidence_width"] = CVPixelBufferGetWidth(confidence)
+                        record["confidence_height"] = CVPixelBufferGetHeight(confidence)
+                    }
+                    let json = try JSONSerialization.data(withJSONObject: record, options: [.prettyPrinted, .sortedKeys])
+                    try json.write(to: folder.appendingPathComponent("frame.json"), options: .atomic)
+                    frames.append(record)
+                    return frames.count
+                }
+                DispatchQueue.main.async { [self] in
+                    pending = false
+                    completion(.success(saved))
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: folder)
+                captureError = error.localizedDescription
+                DispatchQueue.main.async { [self] in
+                    pending = false
+                    failed = true
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    private static func packedDepth(_ buffer: CVPixelBuffer) throws -> Data {
+        guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+            throw datasetError("Impossibile leggere la profondità.")
+        }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { throw datasetError("Profondità assente.") }
+        let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
+        var result = Data(capacity: w * h * 4)
+        for y in 0..<h {
+            let row = base.advanced(by: y * CVPixelBufferGetBytesPerRow(buffer)).assumingMemoryBound(to: Float32.self)
+            for x in 0..<w {
+                var bits = row[x].bitPattern.littleEndian
+                withUnsafeBytes(of: &bits) { result.append(contentsOf: $0) }
+            }
+        }
+        return result
+    }
+
+    private static func packedConfidence(_ buffer: CVPixelBuffer) throws -> Data {
+        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_OneComponent8,
+              CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+            throw datasetError("Formato confidence non supportato.")
+        }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { throw datasetError("Confidence assente.") }
+        let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
+        var result = Data(capacity: w * h)
+        for y in 0..<h {
+            result.append(base.advanced(by: y * CVPixelBufferGetBytesPerRow(buffer)).assumingMemoryBound(to: UInt8.self), count: w)
+        }
+        return result
+    }
+
+    func export(trackingLosses: Int, completion: @escaping (Result<URL, Error>) -> Void) {
+        // Serial queue: any in-flight frame completes before manifest/export.
+        queue.async { [self] in
+            var output: URL?
+            do {
+                guard !frames.isEmpty else { throw datasetError("Nessun fotogramma salvato.") }
+                var manifest: [String: Any] = [
+                    "schema": "lidar-studio-rgbd-1", "app_version": "0.3.2",
+                    "frame_count": frames.count, "frames": frames,
+                    "units": "meters", "depth_format": "float32_little_endian_row_major_no_padding",
+                    "confidence_format": "uint8_row_major_no_padding_0_low_1_medium_2_high",
+                    "image_orientation": "native_sensor_pixels_no_UI_rotation",
+                    "matrix_layout": "array_of_columns",
+                    "camera_axes": "ARKit: x right, y up, forward -z",
+                    "world_axes": "ARKit world, Y up; origin reset at scan start",
+                    "unprojection": "u,v native depth pixels; X=(u-cx)*d/fx, Y=-(v-cy)*d/fy, Z=-d; world=camera_to_world*[X,Y,Z,1]",
+                    "depth_values": "raw sceneDepth; reject nonfinite or <=0; apply confidence and distance filters when processing",
+                    "cloud_voxel_m": voxel, "cloud_max_depth_m": maxDepth,
+                    "cloud_min_depth_m": 0.2, "cloud_min_confidence": 2,
+                    "tracking_limited_episodes": trackingLosses,
+                    "sample_interval_seconds": 1.0, "max_frames": 60,
+                    "note": "Dataset frames are a subset of the frames accumulated into the separately exported PLY. Poses are not refined."
+                ]
+                if let captureError { manifest["capture_error"] = captureError }
+                let json = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+                try json.write(to: directory.appendingPathComponent("manifest.json"), options: .atomic)
+                let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("Dataset-RGBD-\(UUID().uuidString.prefix(8)).zip")
+                output = url
+                try RGBDZip.write(directory: directory, output: url)
+                DispatchQueue.main.async { completion(.success(url)) }
+            } catch {
+                if let output { try? FileManager.default.removeItem(at: output) }
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }
+    }
+}
+
+// ZIP32 with stored entries: one file in memory at a time, no dependencies.
+private enum RGBDZip {
+    private static let crcTable: [UInt32] = (0..<256).map { value in
+        var crc = UInt32(value)
+        for _ in 0..<8 { crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xedb88320 : crc >> 1 }
+        return crc
+    }
+    private static func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xffffffff
+        for byte in data { crc = crcTable[Int((crc ^ UInt32(byte)) & 255)] ^ (crc >> 8) }
+        return crc ^ 0xffffffff
+    }
+    private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var little = value.littleEndian
+        withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+    }
+    static func write(directory: URL, output: URL) throws {
+        guard let iterator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey]) else {
+            throw datasetError("Impossibile elencare il dataset.")
+        }
+        var files: [URL] = []
+        for case let url as URL in iterator {
+            if try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true { files.append(url) }
+        }
+        files.sort { $0.path < $1.path }
+        guard files.count < 65535, FileManager.default.createFile(atPath: output.path, contents: nil) else {
+            throw datasetError("Impossibile creare lo ZIP.")
+        }
+        let handle = try FileHandle(forWritingTo: output)
+        defer { try? handle.close() }
+        var central = Data()
+        for file in files {
+            try autoreleasepool {
+                let relative = file.pathComponents.dropFirst(directory.pathComponents.count).joined(separator: "/")
+                let name = Data(relative.utf8)
+                let body = try Data(contentsOf: file)
+                let offset = try handle.offset()
+                guard name.count < 65535, body.count < Int(UInt32.max), offset < UInt64(UInt32.max) else {
+                    throw datasetError("Dataset troppo grande per ZIP32.")
+                }
+                let size = UInt32(body.count), crc = crc32(body)
+                var local = Data()
+                append(UInt32(0x04034b50), to: &local)
+                for v in [UInt16(20), 0x0800, 0, 0, 33] { append(v, to: &local) }
+                for v in [crc, size, size] { append(v, to: &local) }
+                append(UInt16(name.count), to: &local); append(UInt16(0), to: &local)
+                local.append(name)
+                try handle.write(contentsOf: local); try handle.write(contentsOf: body)
+                append(UInt32(0x02014b50), to: &central)
+                for v in [UInt16(20), 20, 0x0800, 0, 0, 33] { append(v, to: &central) }
+                for v in [crc, size, size] { append(v, to: &central) }
+                for v in [UInt16(name.count), 0, 0, 0, 0] { append(v, to: &central) }
+                append(UInt32(0), to: &central); append(UInt32(offset), to: &central)
+                central.append(name)
+            }
+        }
+        let start = try handle.offset()
+        guard start + UInt64(central.count) < UInt64(UInt32.max) else { throw datasetError("Limite ZIP32 superato.") }
+        try handle.write(contentsOf: central)
+        var end = Data()
+        append(UInt32(0x06054b50), to: &end)
+        for v in [UInt16(0), 0, UInt16(files.count), UInt16(files.count)] { append(v, to: &end) }
+        append(UInt32(central.count), to: &end); append(UInt32(start), to: &end)
+        append(UInt16(0), to: &end)
+        try handle.write(contentsOf: end)
     }
 }
